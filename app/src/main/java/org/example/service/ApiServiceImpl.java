@@ -20,11 +20,12 @@ import org.example.model.UserSummary;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.function.Supplier;
 
 /**
  * Implementation of the ApiService interface with resilience patterns.
+ * Optimized for high throughput (10k TPS) with connection pooling and async processing.
  */
 @Slf4j
 public class ApiServiceImpl implements ApiService {
@@ -33,23 +34,75 @@ public class ApiServiceImpl implements ApiService {
     private static final String USERS_ENDPOINT = "/users";
     private static final String POST_ENDPOINT = "/posts";
     
+    // Connection pool configuration for high throughput
+    private static final int MAX_IDLE_CONNECTIONS = 100;
+    private static final int KEEP_ALIVE_DURATION_MS = 30_000;
+    private static final int CONNECTION_TIMEOUT_MS = 5_000;
+    private static final int READ_TIMEOUT_MS = 10_000;
+    private static final int WRITE_TIMEOUT_MS = 10_000;
+    
+    // Thread pool for async operations
+    private static final int CORE_POOL_SIZE = Runtime.getRuntime().availableProcessors() * 2;
+    private static final int MAX_POOL_SIZE = Runtime.getRuntime().availableProcessors() * 4;
+    private static final int QUEUE_CAPACITY = 10_000;
+    private static final ThreadPoolExecutor EXECUTOR = new ThreadPoolExecutor(
+            CORE_POOL_SIZE,
+            MAX_POOL_SIZE,
+            60L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(QUEUE_CAPACITY),
+            new ThreadPoolExecutor.CallerRunsPolicy());
+    
     private final OkHttpClient client;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
     private final CircuitBreaker circuitBreaker;
     private final Retry retry;
+    private final Dispatcher dispatcher;
     
     /**
      * Constructor with default OkHttpClient and ObjectMapper.
      */
     public ApiServiceImpl() {
-        this(new OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
-                .writeTimeout(30, TimeUnit.SECONDS)
-                .build(),
-             new ObjectMapper(),
+        this(createDefaultHttpClient(),
+             createOptimizedObjectMapper(),
              MetricsConfig.getRegistry());
+    }
+    
+    /**
+     * Creates a default HTTP client optimized for high throughput.
+     * 
+     * @return an optimized OkHttpClient
+     */
+    private static OkHttpClient createDefaultHttpClient() {
+        // Create a connection pool for connection reuse
+        ConnectionPool connectionPool = new ConnectionPool(
+                MAX_IDLE_CONNECTIONS,
+                KEEP_ALIVE_DURATION_MS,
+                TimeUnit.MILLISECONDS);
+        
+        // Create a dispatcher with increased max requests
+        Dispatcher dispatcher = new Dispatcher(EXECUTOR);
+        dispatcher.setMaxRequests(1000);
+        dispatcher.setMaxRequestsPerHost(100);
+        
+        return new OkHttpClient.Builder()
+                .connectionPool(connectionPool)
+                .dispatcher(dispatcher)
+                .connectTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .readTimeout(READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .writeTimeout(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .build();
+    }
+    
+    /**
+     * Creates an optimized ObjectMapper for high-performance JSON processing.
+     * 
+     * @return an optimized ObjectMapper
+     */
+    private static ObjectMapper createOptimizedObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        // Add any performance optimizations for the ObjectMapper
+        return mapper;
     }
     
     /**
@@ -63,22 +116,24 @@ public class ApiServiceImpl implements ApiService {
         this.client = client;
         this.objectMapper = objectMapper;
         this.meterRegistry = meterRegistry;
+        this.dispatcher = client.dispatcher();
         
-        // Configure circuit breaker
+        // Configure circuit breaker with optimized settings for high throughput
         CircuitBreakerConfig circuitBreakerConfig = CircuitBreakerConfig.custom()
                 .failureRateThreshold(50)
                 .waitDurationInOpenState(Duration.ofMillis(1000))
-                .permittedNumberOfCallsInHalfOpenState(2)
-                .slidingWindowSize(10)
+                .permittedNumberOfCallsInHalfOpenState(10)
+                .slidingWindowSize(100)
+                .minimumNumberOfCalls(20)
                 .build();
         
         CircuitBreakerRegistry circuitBreakerRegistry = CircuitBreakerRegistry.of(circuitBreakerConfig);
         this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("apiService");
         
-        // Configure retry
+        // Configure retry with optimized settings for high throughput
         RetryConfig retryConfig = RetryConfig.custom()
                 .maxAttempts(3)
-                .waitDuration(Duration.ofMillis(500))
+                .waitDuration(Duration.ofMillis(100))
                 .retryOnResult(response -> response instanceof List && ((List<?>) response).isEmpty())
                 .retryExceptions(IOException.class)
                 .build();
@@ -86,7 +141,10 @@ public class ApiServiceImpl implements ApiService {
         RetryRegistry retryRegistry = RetryRegistry.of(retryConfig);
         this.retry = retryRegistry.retry("apiService");
         
-        log.info("ApiServiceImpl initialized with circuit breaker and retry configuration");
+        log.info("ApiServiceImpl initialized with high-throughput configuration");
+        log.info("Thread pool: core={}, max={}, queue={}", CORE_POOL_SIZE, MAX_POOL_SIZE, QUEUE_CAPACITY);
+        log.info("Connection pool: maxIdleConnections={}, keepAliveDuration={}ms", 
+                MAX_IDLE_CONNECTIONS, KEEP_ALIVE_DURATION_MS);
     }
     
     @Override
@@ -131,6 +189,47 @@ public class ApiServiceImpl implements ApiService {
             log.error("Unexpected error when fetching users from API", e);
             throw new ApiException("Failed to fetch users", 500, USERS_ENDPOINT, e);
         }
+    }
+    
+    /**
+     * Asynchronously fetch users from the API.
+     * 
+     * @return CompletableFuture containing a list of users
+     */
+    public CompletableFuture<List<User>> fetchUsersAsync() {
+        log.info("Asynchronously fetching users from API");
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                // Decorate the call with retry and circuit breaker
+                Supplier<List<User>> decoratedSupplier = CircuitBreaker.decorateSupplier(
+                        circuitBreaker, 
+                        () -> {
+                            try {
+                                return fetchUsersInternal();
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+                
+                decoratedSupplier = Retry.decorateSupplier(retry, decoratedSupplier);
+                
+                List<User> users = decoratedSupplier.get();
+                log.info("Successfully fetched {} users from API asynchronously", users.size());
+                
+                sample.stop(meterRegistry.timer("api.fetch.users.async.time"));
+                meterRegistry.counter("api.fetch.users.async.count").increment();
+                
+                return users;
+            } catch (Exception e) {
+                sample.stop(meterRegistry.timer("api.fetch.users.async.error.time"));
+                meterRegistry.counter("api.fetch.users.async.error.count").increment();
+                
+                log.error("Error in async user fetch", e);
+                throw new CompletionException(e);
+            }
+        }, EXECUTOR);
     }
     
     /**
@@ -214,6 +313,49 @@ public class ApiServiceImpl implements ApiService {
     }
     
     /**
+     * Asynchronously post a user summary to the API.
+     * 
+     * @param userSummary the user summary to post
+     * @return CompletableFuture containing the result of the operation
+     */
+    public CompletableFuture<Boolean> postUserSummaryAsync(UserSummary userSummary) {
+        log.info("Asynchronously posting user summary for user: {}", userSummary.getFullName());
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                // Decorate the call with retry and circuit breaker
+                Supplier<Boolean> decoratedSupplier = CircuitBreaker.decorateSupplier(
+                        circuitBreaker, 
+                        () -> {
+                            try {
+                                return postUserSummaryInternal(userSummary);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+                
+                decoratedSupplier = Retry.decorateSupplier(retry, decoratedSupplier);
+                
+                boolean result = decoratedSupplier.get();
+                log.info("Successfully posted user summary for user: {} asynchronously", 
+                        userSummary.getFullName());
+                
+                sample.stop(meterRegistry.timer("api.post.user.async.time"));
+                meterRegistry.counter("api.post.user.async.count").increment();
+                
+                return result;
+            } catch (Exception e) {
+                sample.stop(meterRegistry.timer("api.post.user.async.error.time"));
+                meterRegistry.counter("api.post.user.async.error.count").increment();
+                
+                log.error("Error in async user summary post", e);
+                throw new CompletionException(e);
+            }
+        }, EXECUTOR);
+    }
+    
+    /**
      * Internal method to post a user summary to the API.
      *
      * @param userSummary the user summary to post
@@ -244,5 +386,48 @@ public class ApiServiceImpl implements ApiService {
             
             return true;
         }
+    }
+    
+    /**
+     * Get the current number of active connections.
+     * Useful for monitoring connection usage.
+     * 
+     * @return the number of active connections
+     */
+    public int getActiveConnectionCount() {
+        return dispatcher.runningCallsCount();
+    }
+    
+    /**
+     * Get the current number of queued requests.
+     * Useful for monitoring backpressure.
+     * 
+     * @return the number of queued requests
+     */
+    public int getQueuedRequestCount() {
+        return dispatcher.queuedCallsCount();
+    }
+    
+    /**
+     * Gracefully shutdown the service, ensuring all pending requests are completed.
+     */
+    public void shutdown() {
+        log.info("Shutting down ApiServiceImpl");
+        
+        // Shutdown the executor service
+        EXECUTOR.shutdown();
+        try {
+            if (!EXECUTOR.awaitTermination(30, TimeUnit.SECONDS)) {
+                EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            EXECUTOR.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        
+        // Shutdown the OkHttp dispatcher
+        dispatcher.executorService().shutdown();
+        
+        log.info("ApiServiceImpl shutdown complete");
     }
 } 

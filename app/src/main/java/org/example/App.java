@@ -12,17 +12,33 @@ import org.example.service.ApiServiceImpl;
 import org.example.service.UserTransformationService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Main application class that demonstrates fetching data from an API,
  * transforming it, and posting the transformed data.
+ * Optimized for high throughput (10k TPS).
  */
 @Slf4j
 public class App {
     private final ApiService apiService;
+    private final ApiServiceImpl apiServiceImpl; // For async methods
     private final UserTransformationService transformationService;
+    private final ExecutorService executorService;
+
+    // Number of threads for parallel processing
+    private static final int THREAD_POOL_SIZE = Runtime.getRuntime().availableProcessors() * 2;
+    
+    // Batch size for processing
+    private static final int BATCH_SIZE = 100;
 
     /**
      * Constructor with default services.
@@ -41,6 +57,19 @@ public class App {
     public App(ApiService apiService, UserTransformationService transformationService) {
         this.apiService = apiService;
         this.transformationService = transformationService;
+        
+        // Cast to ApiServiceImpl if possible for async methods
+        if (apiService instanceof ApiServiceImpl) {
+            this.apiServiceImpl = (ApiServiceImpl) apiService;
+        } else {
+            this.apiServiceImpl = null;
+            log.warn("ApiService is not an instance of ApiServiceImpl, async methods will not be available");
+        }
+        
+        // Create a thread pool for parallel processing
+        this.executorService = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        log.info("App initialized with thread pool size: {}", THREAD_POOL_SIZE);
+        
         log.debug("App initialized with custom services");
     }
 
@@ -64,6 +93,27 @@ public class App {
             throw new ApiException("Failed to fetch users", 500, "/users", e);
         }
     }
+    
+    /**
+     * Fetches users from the API asynchronously.
+     *
+     * @return a CompletableFuture containing a list of users
+     */
+    public CompletableFuture<List<User>> fetchUsersAsync() {
+        if (apiServiceImpl == null) {
+            log.warn("ApiServiceImpl not available, falling back to synchronous method");
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    return fetchUsers();
+                } catch (IOException e) {
+                    throw new CompletionException(e);
+                }
+            }, executorService);
+        }
+        
+        log.info("Fetching users from API asynchronously");
+        return apiServiceImpl.fetchUsersAsync();
+    }
 
     /**
      * Transforms users into user summaries.
@@ -81,6 +131,36 @@ public class App {
         List<UserSummary> summaries = transformationService.transformUsers(users);
         log.info("Successfully transformed {} users into summaries", summaries.size());
         return summaries;
+    }
+    
+    /**
+     * Transforms users into user summaries in parallel for high throughput.
+     *
+     * @param users the users to transform
+     * @return a list of user summaries
+     */
+    public List<UserSummary> transformUsersParallel(List<User> users) {
+        if (users == null) {
+            log.warn("Attempted to transform null user list, returning empty list");
+            return Collections.emptyList();
+        }
+        
+        log.info("Transforming {} users into summaries in parallel", users.size());
+        
+        // Process in batches for better performance
+        List<List<User>> batches = new ArrayList<>();
+        for (int i = 0; i < users.size(); i += BATCH_SIZE) {
+            batches.add(users.subList(i, Math.min(i + BATCH_SIZE, users.size())));
+        }
+        
+        // Process each batch in parallel
+        List<UserSummary> result = batches.parallelStream()
+                .map(transformationService::transformUsers)
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
+        
+        log.info("Successfully transformed {} users into summaries in parallel", result.size());
+        return result;
     }
 
     /**
@@ -106,6 +186,43 @@ public class App {
         log.info("Successfully filtered and transformed {} users with email domain: {}", 
                 summaries.size(), domain);
         return summaries;
+    }
+    
+    /**
+     * Filters users by email domain and transforms them into user summaries in parallel.
+     *
+     * @param users the users to filter and transform
+     * @param domain the email domain to filter by
+     * @return a list of filtered and transformed user summaries
+     */
+    public List<UserSummary> filterByEmailDomainAndTransformParallel(List<User> users, String domain) {
+        if (users == null) {
+            log.warn("Attempted to filter null user list, returning empty list");
+            return Collections.emptyList();
+        }
+        
+        if (domain == null || domain.isEmpty()) {
+            log.warn("Attempted to filter by null or empty domain, returning all users");
+            return transformUsersParallel(users);
+        }
+        
+        log.info("Filtering {} users by email domain: {} in parallel", users.size(), domain);
+        
+        // Process in batches for better performance
+        List<List<User>> batches = new ArrayList<>();
+        for (int i = 0; i < users.size(); i += BATCH_SIZE) {
+            batches.add(users.subList(i, Math.min(i + BATCH_SIZE, users.size())));
+        }
+        
+        // Process each batch in parallel
+        List<UserSummary> result = batches.parallelStream()
+                .map(batch -> transformationService.filterByEmailDomainAndTransform(batch, domain))
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
+        
+        log.info("Successfully filtered and transformed {} users with email domain: {} in parallel", 
+                result.size(), domain);
+        return result;
     }
 
     /**
@@ -136,9 +253,72 @@ public class App {
             throw new ApiException("Failed to post user summary", 500, "/posts", e);
         }
     }
+    
+    /**
+     * Posts a user summary to the API asynchronously.
+     *
+     * @param userSummary the user summary to post
+     * @return a CompletableFuture containing the result of the operation
+     */
+    public CompletableFuture<Boolean> postUserSummaryAsync(UserSummary userSummary) {
+        if (userSummary == null) {
+            log.warn("Attempted to post null user summary asynchronously, returning false");
+            return CompletableFuture.completedFuture(false);
+        }
+        
+        if (apiServiceImpl == null) {
+            log.warn("ApiServiceImpl not available, falling back to synchronous method");
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    return postUserSummary(userSummary);
+                } catch (IOException e) {
+                    throw new CompletionException(e);
+                }
+            }, executorService);
+        }
+        
+        log.info("Posting user summary for user: {} asynchronously", userSummary.getFullName());
+        return apiServiceImpl.postUserSummaryAsync(userSummary);
+    }
+    
+    /**
+     * Posts multiple user summaries to the API in parallel.
+     *
+     * @param summaries the list of user summaries to post
+     * @return a list of results indicating success or failure for each summary
+     */
+    public List<Boolean> postUserSummariesParallel(List<UserSummary> summaries) {
+        if (summaries == null || summaries.isEmpty()) {
+            log.warn("Attempted to post null or empty user summaries list, returning empty list");
+            return Collections.emptyList();
+        }
+        
+        log.info("Posting {} user summaries in parallel", summaries.size());
+        
+        List<CompletableFuture<Boolean>> futures = summaries.stream()
+                .map(this::postUserSummaryAsync)
+                .collect(Collectors.toList());
+        
+        // Wait for all futures to complete
+        CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0]));
+        
+        // Get results
+        List<Boolean> results = allFutures.thenApply(v -> 
+                futures.stream()
+                        .map(CompletableFuture::join)
+                        .collect(Collectors.toList())
+        ).join();
+        
+        long successCount = results.stream().filter(Boolean::booleanValue).count();
+        log.info("Successfully posted {}/{} user summaries in parallel", successCount, summaries.size());
+        
+        return results;
+    }
 
     /**
      * Demonstrates the complete workflow: fetch, transform, and post.
+     * Optimized for high throughput with async and parallel processing.
      *
      * @param args command line arguments
      */
@@ -147,13 +327,16 @@ public class App {
         App app = new App();
         
         try {
-            // Fetch users from API
-            List<User> users = app.fetchUsers();
+            // Fetch users from API asynchronously
+            CompletableFuture<List<User>> usersFuture = app.fetchUsersAsync();
+            
+            // Wait for users to be fetched
+            List<User> users = usersFuture.join();
             log.info("Fetched {} users from API", users.size());
             
-            // Filter users by email domain and transform
+            // Filter users by email domain and transform in parallel
             String emailDomain = "example.com";
-            List<UserSummary> filteredSummaries = app.filterByEmailDomainAndTransform(users, emailDomain);
+            List<UserSummary> filteredSummaries = app.filterByEmailDomainAndTransformParallel(users, emailDomain);
             log.info("Filtered and transformed {} users with email domain: {}", 
                     filteredSummaries.size(), emailDomain);
             
@@ -166,33 +349,38 @@ public class App {
                         filteredSummaries.size(), city);
             }
             
-            // Post each user summary
-            int successCount = 0;
-            for (UserSummary summary : filteredSummaries) {
-                try {
-                    boolean success = app.postUserSummary(summary);
-                    if (success) {
-                        successCount++;
-                    }
-                    log.info("Posted user summary for {} ({}): {}", 
-                            summary.getFullName(), summary.getUserId(), 
-                            (success ? "SUCCESS" : "FAILED"));
-                } catch (Exception e) {
-                    log.error("Error posting user summary for {}: {}", 
-                            summary.getFullName(), e.getMessage());
-                }
+            // Post all user summaries in parallel
+            List<Boolean> results = app.postUserSummariesParallel(filteredSummaries);
+            
+            // Log results
+            for (int i = 0; i < filteredSummaries.size(); i++) {
+                UserSummary summary = filteredSummaries.get(i);
+                boolean success = results.get(i);
+                log.info("Posted user summary for {} ({}): {}", 
+                        summary.getFullName(), summary.getUserId(), 
+                        (success ? "SUCCESS" : "FAILED"));
             }
             
+            long successCount = results.stream().filter(Boolean::booleanValue).count();
             log.info("Successfully posted {}/{} user summaries", 
                     successCount, filteredSummaries.size());
+            
+            // Shutdown executor service
+            app.executorService.shutdown();
+            if (!app.executorService.awaitTermination(30, TimeUnit.SECONDS)) {
+                app.executorService.shutdownNow();
+            }
+            
+            // Shutdown ApiServiceImpl if available
+            if (app.apiServiceImpl != null) {
+                app.apiServiceImpl.shutdown();
+            }
+            
             log.info("Application completed successfully");
             
-        } catch (IOException e) {
-            log.error("Error during API operations: {}", e.getMessage(), e);
-            System.err.println("Error during API operations: " + e.getMessage());
         } catch (Exception e) {
-            log.error("Unexpected error: {}", e.getMessage(), e);
-            System.err.println("Unexpected error: " + e.getMessage());
+            log.error("Error during application execution: {}", e.getMessage(), e);
+            System.err.println("Error during application execution: " + e.getMessage());
         }
     }
 }
