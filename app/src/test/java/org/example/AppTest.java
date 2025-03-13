@@ -8,6 +8,7 @@ import org.example.model.Company;
 import org.example.model.User;
 import org.example.model.UserSummary;
 import org.example.service.ApiService;
+import org.example.service.ApiServiceImpl;
 import org.example.service.UserTransformationService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,10 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -30,13 +35,17 @@ class AppTest {
     private ApiService apiService;
     
     @Mock
+    private ApiServiceImpl apiServiceImpl;
+    
+    @Mock
     private UserTransformationService transformationService;
     
     private App app;
     
     @BeforeEach
     void setUp() {
-        app = new App(apiService, transformationService);
+        // Create app with ApiServiceImpl for testing async methods
+        app = new App(apiServiceImpl, transformationService);
     }
     
     @Test
@@ -45,12 +54,31 @@ class AppTest {
         List<User> expectedUsers = Collections.singletonList(createTestUser());
         when(apiService.fetchUsers()).thenReturn(expectedUsers);
         
+        // Create a new app with the mocked ApiService
+        App testApp = new App(apiService, transformationService);
+        
         // Act
-        List<User> actualUsers = app.fetchUsers();
+        List<User> actualUsers = testApp.fetchUsers();
         
         // Assert
         assertEquals(expectedUsers, actualUsers);
         verify(apiService).fetchUsers();
+    }
+    
+    @Test
+    void fetchUsersAsync_shouldCallApiServiceImplAsync() throws ExecutionException, InterruptedException, TimeoutException {
+        // Arrange
+        List<User> expectedUsers = Collections.singletonList(createTestUser());
+        CompletableFuture<List<User>> future = CompletableFuture.completedFuture(expectedUsers);
+        when(apiServiceImpl.fetchUsersAsync()).thenReturn(future);
+        
+        // Act
+        CompletableFuture<List<User>> resultFuture = app.fetchUsersAsync();
+        List<User> actualUsers = resultFuture.get(5, TimeUnit.SECONDS);
+        
+        // Assert
+        assertEquals(expectedUsers, actualUsers);
+        verify(apiServiceImpl).fetchUsersAsync();
     }
     
     @Test
@@ -66,6 +94,31 @@ class AppTest {
         // Assert
         assertEquals(expectedSummaries, actualSummaries);
         verify(transformationService).transformUsers(users);
+    }
+    
+    @Test
+    void transformUsersParallel_shouldTransformInParallel() {
+        // Arrange
+        List<User> users = Arrays.asList(createTestUser(), createTestUser(), createTestUser());
+        List<UserSummary> expectedSummaries = Arrays.asList(
+                new UserSummary(createTestUser()),
+                new UserSummary(createTestUser()),
+                new UserSummary(createTestUser())
+        );
+        
+        // Mock the transformationService to return the expected summaries for any batch
+        when(transformationService.transformUsers(anyList())).thenReturn(expectedSummaries);
+        
+        // Act
+        List<UserSummary> actualSummaries = app.transformUsersParallel(users);
+        
+        // Assert
+        assertNotNull(actualSummaries);
+        // The size will be a multiple of the expected summaries size due to batching
+        assertTrue(actualSummaries.size() > 0);
+        
+        // Verify transformationService was called at least once
+        verify(transformationService, atLeastOnce()).transformUsers(anyList());
     }
     
     @Test
@@ -85,17 +138,79 @@ class AppTest {
     }
     
     @Test
+    void filterByEmailDomainAndTransformParallel_shouldFilterInParallel() {
+        // Arrange
+        List<User> users = Arrays.asList(createTestUser(), createTestUser(), createTestUser());
+        String domain = "example.com";
+        List<UserSummary> expectedSummaries = Collections.singletonList(new UserSummary(createTestUser()));
+        
+        // Mock the transformationService to return the expected summaries for any batch
+        when(transformationService.filterByEmailDomainAndTransform(anyList(), eq(domain))).thenReturn(expectedSummaries);
+        
+        // Act
+        List<UserSummary> actualSummaries = app.filterByEmailDomainAndTransformParallel(users, domain);
+        
+        // Assert
+        assertNotNull(actualSummaries);
+        assertTrue(actualSummaries.size() > 0);
+        
+        // Verify transformationService was called at least once
+        verify(transformationService, atLeastOnce()).filterByEmailDomainAndTransform(anyList(), eq(domain));
+    }
+    
+    @Test
     void postUserSummary_shouldCallApiService() throws IOException {
         // Arrange
         UserSummary userSummary = new UserSummary(createTestUser());
-        when(apiService.postUserSummary(userSummary)).thenReturn(true);
+        when(apiServiceImpl.postUserSummary(userSummary)).thenReturn(true);
         
         // Act
         boolean result = app.postUserSummary(userSummary);
         
         // Assert
         assertTrue(result);
-        verify(apiService).postUserSummary(userSummary);
+        verify(apiServiceImpl).postUserSummary(userSummary);
+    }
+    
+    @Test
+    void postUserSummaryAsync_shouldCallApiServiceImplAsync() throws ExecutionException, InterruptedException, TimeoutException {
+        // Arrange
+        UserSummary userSummary = new UserSummary(createTestUser());
+        CompletableFuture<Boolean> future = CompletableFuture.completedFuture(true);
+        when(apiServiceImpl.postUserSummaryAsync(userSummary)).thenReturn(future);
+        
+        // Act
+        CompletableFuture<Boolean> resultFuture = app.postUserSummaryAsync(userSummary);
+        boolean result = resultFuture.get(5, TimeUnit.SECONDS);
+        
+        // Assert
+        assertTrue(result);
+        verify(apiServiceImpl).postUserSummaryAsync(userSummary);
+    }
+    
+    @Test
+    void postUserSummariesParallel_shouldPostInParallel() throws Exception {
+        // Arrange
+        List<UserSummary> summaries = Arrays.asList(
+                new UserSummary(createTestUser()),
+                new UserSummary(createTestUser())
+        );
+        
+        // Mock the async method to return true for any summary
+        when(apiServiceImpl.postUserSummaryAsync(any(UserSummary.class)))
+                .thenReturn(CompletableFuture.completedFuture(true));
+        
+        // Act
+        List<Boolean> results = app.postUserSummariesParallel(summaries);
+        
+        // Assert
+        assertNotNull(results);
+        assertEquals(2, results.size());
+        assertTrue(results.get(0));
+        assertTrue(results.get(1));
+        
+        // Verify apiServiceImpl was called for each summary
+        verify(apiServiceImpl, times(2)).postUserSummaryAsync(any(UserSummary.class));
     }
     
     private User createTestUser() {
